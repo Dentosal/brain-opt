@@ -403,6 +403,41 @@ pub fn optimize_remove_nops(mut ops: Vec<Instruction>) -> Vec<Instruction> {
     ops
 }
 
+/// Removes jumps that are never followed
+pub fn optimize_dead_jumps(mut ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut index: usize = 0;
+    'outer: while index < ops.len() {
+        if let JumpZero(_) = ops[index].clone() {
+            let mut neg_offset: usize = 1;
+            while index > neg_offset {
+                // If flags are set and there are no jumps between these, then this jump is required
+                if ops[index - neg_offset].effects().map_or(false, |e| e.flags) {
+                    break;
+                } else if let JumpZero(_) = ops[index - neg_offset] {
+                    ops.remove(index);
+                    continue 'outer;
+                }
+                neg_offset += 1;
+            }
+        } else if let JumpNonZero(_) = ops[index].clone() {
+            let mut neg_offset: usize = 1;
+            while index > neg_offset {
+                // If flags are set and there are no jumps between these, then this jump is required
+                if ops[index - neg_offset].effects().map_or(false, |e| e.flags) {
+                    break;
+                } else if let JumpNonZero(_) = ops[index - neg_offset] {
+                    ops.remove(index);
+                    continue 'outer;
+                }
+                neg_offset += 1;
+            }
+        }
+        index += 1;
+    }
+    ops
+}
+
 pub fn label_index(ops: &[Instruction], label: &str) -> usize {
     let t = Instruction::Label(label.to_owned());
     for (i, op) in ops.iter().cloned().enumerate() {
@@ -544,29 +579,31 @@ pub fn optimize(mut ops: Vec<Instruction>) -> Vec<Instruction> {
         ($optimizer:ident; $name:ident) => {pass!($optimizer; $name;)};
     };
 
-    pass!(optimizer; optimize_start_cells);
-    pass!(optimizer; optimize_zero_loop);
-    pass!(optimizer; optimize_zero_flags);
     pass!(optimizer; optimize_remove_unused_labels);
-    pass!(optimizer; optimize_remove_nops);
+    pass!(optimizer; optimize_start_cells; optimize_remove_unused_labels);
+    pass!(optimizer; optimize_zero_loop);
+    pass!(optimizer; optimize_zero_flags; optimize_remove_unused_labels);
+    pass!(optimizer; optimize_remove_nops; optimize_remove_unused_labels);
     pass!(optimizer; optimize_adjacent; optimize_remove_nops);
     pass!(optimizer; optimize_adjancent_mem_movs; optimize_remove_nops, optimize_zero_loop, optimize_adjacent);
     pass!(optimizer; optimize_constant_output);
-    pass!(optimizer; optimize_jump_skip_recheck; optimize_remove_unused_labels, optimize_remove_nops);
+    pass!(optimizer; optimize_dead_jumps; optimize_remove_unused_labels, optimize_remove_nops);
+    pass!(optimizer; optimize_jump_skip_recheck; optimize_remove_unused_labels, optimize_dead_jumps);
     pass!(optimizer; optimize_remove_dead_code; optimize_remove_unused_labels, optimize_remove_nops);
-    pass!(optimizer; optimize_exit; optimize_remove_unused_labels, optimize_remove_nops);
+    pass!(optimizer; optimize_exit; optimize_remove_unused_labels, optimize_dead_jumps, optimize_zero_flags, optimize_remove_nops);
 
-    for pass in optimizer.passes.clone() {
+    let mut queue: Vec<_> = optimizer.passes.iter().cloned().rev().collect();
+    while let Some(pass) = queue.pop() {
         log::trace!("Optimization: {}", pass.name);
         ops = (pass.function)(ops);
         ops = move_data_to_end(ops);
         for pass_id in pass.cleanup {
-            log::trace!("Optimization (cleanup): {}", optimizer.get(pass_id).name);
-            ops = (optimizer.get(pass_id).function)(ops);
-            ops = move_data_to_end(ops);
+            let p = optimizer.get(pass_id);
+            if queue.last() != Some(&p) {
+                queue.push(p);
+            }
         }
     }
-
     ops
 }
 
