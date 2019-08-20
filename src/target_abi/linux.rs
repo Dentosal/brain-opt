@@ -1,4 +1,4 @@
-use crate::codegen::{Effects, Instruction, Register64};
+use crate::instruction::{Effects, Instruction, Register64};
 
 use super::{LinkerInfo, Operations};
 

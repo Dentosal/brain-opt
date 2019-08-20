@@ -5,9 +5,10 @@
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::cast_possible_truncation)]
 
-mod codegen;
 mod compiler;
 pub mod error;
+mod instruction;
+mod optimizer;
 mod parser;
 pub mod target_abi;
 

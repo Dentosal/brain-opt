@@ -1,7 +1,8 @@
 use std::fmt;
 use std::ops::Index;
 
-use crate::codegen::{self, Effects, Instruction, Register64};
+use crate::instruction::{Effects, Instruction, Register64};
+use crate::optimizer;
 use crate::parser::Token;
 use crate::target_abi::{self, LinkerInfo, ABI};
 
@@ -210,7 +211,7 @@ impl State {
         let startup: Vec<Instruction> = abi_ops.startup();
         let exit: Vec<Instruction> = abi_ops.exit();
 
-        let body = codegen::optimize(
+        let body = optimizer::optimize(
             startup
                 .iter()
                 .chain(steps.iter())
@@ -218,7 +219,7 @@ impl State {
                 .cloned()
                 .collect(),
         );
-        let (body, data) = codegen::separate_data(body);
+        let (body, data) = optimizer::separate_data(body);
 
         let header = vec![
             Instruction::BlackBox("sub rsp, $arraylen".to_owned(), Effects::VOLATILE),

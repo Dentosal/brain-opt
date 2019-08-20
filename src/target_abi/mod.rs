@@ -3,7 +3,7 @@ mod macos;
 
 use strum_macros::{EnumString, EnumVariantNames};
 
-use crate::codegen::{Instruction, Register64};
+use crate::instruction::{Instruction, Register64};
 
 /// Instructions for linking
 #[derive(Debug, Clone, PartialEq, Eq)]
