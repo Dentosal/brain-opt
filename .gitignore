@@ -1,0 +1,10 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Vagrant
+.vagrant/
+
+# Temp files
+tmp*.bf

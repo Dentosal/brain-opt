@@ -1,0 +1,889 @@
+#![allow(clippy::needless_pass_by_value)]
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+type AssemblyString = String;
+
+fn format_data(data: &[u8]) -> String {
+    let mut result = String::new();
+    let mut in_string = false;
+    for byte in data {
+        let c = *byte as char;
+        if c.is_ascii_graphic() || c == ' ' {
+            if !in_string {
+                result.push('"');
+                in_string = true;
+            }
+            result.push(c);
+        } else {
+            if in_string {
+                result.push('"');
+                result.push(',');
+                in_string = false;
+            }
+            result.push_str(&format!("{:#02x}", byte));
+            result.push(',');
+        }
+    }
+    result = result.trim_end_matches(',').to_owned();
+    if in_string {
+        result.push('"');
+    }
+    result
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Register64 {
+    rax,
+    rbx,
+    rcx,
+    rdx,
+    rsi,
+    rdi,
+    rsp,
+    r10,
+    r11,
+    r12,
+}
+impl fmt::Display for Register64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+/// What effects does instruction cause
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Effects {
+    /// Affects flags (Zero flag considered here)
+    pub flags: bool,
+    /// Affects registers
+    pub registers: bool,
+    /// Conditional branching
+    pub control_flow: bool,
+    /// Affects stack
+    pub stack: bool,
+    /// File IO
+    pub io: bool,
+}
+impl Effects {
+    /// Volatile operation, should not be moved or eliminated
+    pub(crate) const VOLATILE: Self = Self {
+        flags: true,
+        registers: true,
+        control_flow: true,
+        stack: true,
+        io: true,
+    };
+
+    /// Register-only operation
+    const REG: Self = Self {
+        flags: false,
+        registers: true,
+        control_flow: false,
+        stack: false,
+        io: false,
+    };
+
+    /// Flag operation
+    const FLAG: Self = Self {
+        flags: true,
+        registers: false,
+        control_flow: false,
+        stack: false,
+        io: false,
+    };
+
+    /// Register + Flag operation
+    const ARITHMETIC: Self = Self {
+        flags: true,
+        registers: true,
+        control_flow: false,
+        stack: false,
+        io: false,
+    };
+
+    /// Jump
+    const JUMP: Self = Self {
+        flags: false,
+        registers: false,
+        control_flow: true,
+        stack: false,
+        io: false,
+    };
+
+    /// Label, considering origin
+    const LABEL: Self = Self {
+        flags: true,
+        registers: true,
+        control_flow: false,
+        stack: false,
+        io: false,
+    };
+
+    /// No-op
+    const NOP: Self = Self {
+        flags: false,
+        registers: false,
+        control_flow: false,
+        stack: false,
+        io: false,
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Instruction {
+    /// Black box, i.e. raw assembly that optimizer should pass through
+    BlackBox(AssemblyString, Effects),
+    /// Named black box, i.e. black box containing identifier for optimizer
+    NamedBlackBox(String, AssemblyString, Effects),
+    /// `mov rax, 2`
+    MovImm(Register64, u64),
+    /// `mov rax, label`
+    MovImmVar(Register64, String),
+    /// `mov rax, rbx`
+    Mov(Register64, Register64),
+    /// `mov byte [rax], 2`
+    MovPtr8Imm(Register64, u8),
+    /// `mov word [rax], 2`
+    MovPtr16Imm(Register64, u16),
+    /// `mov dword [rax], 2`
+    MovPtr32Imm(Register64, u32),
+    /// `mov quad [rax], 2`
+    MovPtr64Imm(Register64, u64),
+    /// `add rax, 2`
+    AddImm(Register64, u64),
+    /// `sub rax, 2`
+    SubImm(Register64, u64),
+    /// `add byte [rax], 2`
+    AddPtr8Imm(Register64, u8),
+    /// `add word [rax], 2`
+    AddPtr16Imm(Register64, u16),
+    /// `add dword [rax], 2`
+    AddPtr32Imm(Register64, u32),
+    /// `add quad [rax], 2`
+    AddPtr64Imm(Register64, u64),
+    /// `test eax, eax` (always followed by conditional jump)
+    IsZero(Register64),
+    /// `cmp byte [eax], 0` (always followed by conditional jump)
+    IsZeroPtr8(Register64),
+    /// `jz .label2`
+    JumpZero(String),
+    /// `jnz .label2`
+    JumpNonZero(String),
+    /// `jmp .label2`
+    Jump(String),
+    /// `.label2:` (Label(".label2"))
+    Label(String),
+    /// `name: db "abc", 10, 13` (in section .data)
+    Data(String, Vec<u8>),
+}
+impl Instruction {
+    pub fn to_source(&self) -> String {
+        match self {
+            Self::BlackBox(src, _) => src.clone(),
+            Self::NamedBlackBox(_, src, _) => src.clone(),
+            Self::MovImm(r, imm) => match imm {
+                0 => format!("xor {}, {}", r, r),
+                i => format!("mov {}, {}", r, i),
+            },
+            Self::MovImmVar(r, label) => format!("mov {}, {}", r, label),
+            Self::Mov(r1, r2) => format!("mov {}, {}", r1, r2),
+            Self::MovPtr8Imm(r, imm) => format!("mov byte [{}], {}", r, imm),
+            Self::MovPtr16Imm(r, imm) => format!("mov word [{}], {}", r, imm),
+            Self::MovPtr32Imm(r, imm) => format!("mov dword [{}], {}", r, imm),
+            Self::MovPtr64Imm(r, imm) => format!("mov quad [{}], {}", r, imm),
+            Self::AddImm(r, imm) => match imm {
+                1 => format!("inc {}", r),
+                i => format!("add {}, {}", r, i),
+            },
+            Self::SubImm(r, imm) => match imm {
+                1 => format!("dec {}", r),
+                i => format!("sub {}, {}", r, i),
+            },
+            Self::AddPtr8Imm(r, imm) => match imm {
+                255 => format!("dec byte [{}]", r),
+                1 => format!("inc byte [{}]", r),
+                i => format!("add byte [{}], {}", r, i),
+            },
+            Self::AddPtr16Imm(r, imm) => format!("add word [{}], {}", r, imm),
+            Self::AddPtr32Imm(r, imm) => format!("add dword [{}], {}", r, imm),
+            Self::AddPtr64Imm(r, imm) => format!("add quad [{}], {}", r, imm),
+            Self::IsZero(r) => format!("test {}, {}", r, r),
+            Self::IsZeroPtr8(r) => format!("cmp byte [{}], 0", r),
+            Self::JumpZero(n) => format!("jz {}", n),
+            Self::JumpNonZero(n) => format!("jnz {}", n),
+            Self::Jump(n) => format!("jmp {}", n),
+            Self::Label(n) => format!("{}:", n),
+            Self::Data(n, v) => format!("{}: db {}", n, format_data(v)),
+        }
+    }
+
+    /// Whether this instruction affects the zero flag
+    pub fn affects_zero_flag(&self) -> bool {
+        self.effects().map_or(false, |e| e.flags)
+    }
+
+    /// Does this instruction use zero flag?
+    pub fn reads_zf(&self) -> bool {
+        match self {
+            Self::BlackBox(_, _) => true,
+            Self::NamedBlackBox(_, _, _) => true,
+            Self::MovImm(_, _) => false,
+            Self::MovImmVar(_, _) => false,
+            Self::Mov(_, _) => false,
+            Self::MovPtr8Imm(_, _) => false,
+            Self::MovPtr16Imm(_, _) => false,
+            Self::MovPtr32Imm(_, _) => false,
+            Self::MovPtr64Imm(_, _) => false,
+            Self::AddImm(_, 0) => false,
+            Self::SubImm(_, 0) => false,
+            Self::AddImm(_, _) => false,
+            Self::SubImm(_, _) => false,
+            Self::AddPtr8Imm(_, 0) => false,
+            Self::AddPtr16Imm(_, 0) => false,
+            Self::AddPtr32Imm(_, 0) => false,
+            Self::AddPtr64Imm(_, 0) => false,
+            Self::AddPtr8Imm(_, _) => false,
+            Self::AddPtr16Imm(_, _) => false,
+            Self::AddPtr32Imm(_, _) => false,
+            Self::AddPtr64Imm(_, _) => false,
+            Self::IsZero(_) => false,
+            Self::IsZeroPtr8(_) => false,
+            Self::JumpZero(_) => true,
+            Self::JumpNonZero(_) => true,
+            Self::Jump(_) => false,
+            Self::Label(_) => false,
+            Self::Data(_, _) => false,
+        }
+    }
+
+    /// Returns none for static data, as it must not be executed
+    pub fn effects(&self) -> Option<Effects> {
+        Some(match self {
+            Self::BlackBox(_, e) => *e,
+            Self::NamedBlackBox(_, _, e) => *e,
+            Self::MovImm(_, _) => Effects::REG,
+            Self::MovImmVar(_, _) => Effects::REG,
+            Self::Mov(_, _) => Effects::REG,
+            Self::MovPtr8Imm(_, _) => Effects::REG,
+            Self::MovPtr16Imm(_, _) => Effects::REG,
+            Self::MovPtr32Imm(_, _) => Effects::REG,
+            Self::MovPtr64Imm(_, _) => Effects::REG,
+            Self::AddImm(_, 0) => Effects::FLAG,
+            Self::SubImm(_, 0) => Effects::FLAG,
+            Self::AddImm(_, _) => Effects::ARITHMETIC,
+            Self::SubImm(_, _) => Effects::ARITHMETIC,
+            Self::AddPtr8Imm(_, 0) => Effects::FLAG,
+            Self::AddPtr16Imm(_, 0) => Effects::FLAG,
+            Self::AddPtr32Imm(_, 0) => Effects::FLAG,
+            Self::AddPtr64Imm(_, 0) => Effects::FLAG,
+            Self::AddPtr8Imm(_, _) => Effects::ARITHMETIC,
+            Self::AddPtr16Imm(_, _) => Effects::ARITHMETIC,
+            Self::AddPtr32Imm(_, _) => Effects::ARITHMETIC,
+            Self::AddPtr64Imm(_, _) => Effects::ARITHMETIC,
+            Self::IsZero(_) => Effects::FLAG,
+            Self::IsZeroPtr8(_) => Effects::FLAG,
+            Self::JumpZero(_) => Effects::JUMP,
+            Self::JumpNonZero(_) => Effects::JUMP,
+            Self::Jump(_) => Effects::JUMP,
+            Self::Label(_) => Effects::LABEL, // Jump can end here
+            Self::Data(_, _) => {
+                return None;
+            },
+        })
+    }
+
+    /// Combines two instructions into one if possible
+    pub fn combine(self, other: Self) -> Vec<Self> {
+        use Instruction::*;
+        if let AddPtr8Imm(r0, v0) = self.clone() {
+            if let AddPtr8Imm(r1, v1) = other.clone() {
+                if r0 == r1 {
+                    return vec![AddPtr8Imm(r0, v0.wrapping_add(v1))];
+                }
+            } else if let MovPtr8Imm(r1, v1) = other.clone() {
+                if r0 == r1 {
+                    return vec![MovPtr8Imm(r0, v1)];
+                }
+            }
+        } else if let MovPtr8Imm(r0, v0) = self.clone() {
+            if let AddPtr8Imm(r1, v1) = other.clone() {
+                if r0 == r1 {
+                    return vec![MovPtr8Imm(r0, v0.wrapping_add(v1))];
+                }
+            }
+        } else if let AddImm(r0, v0) = self.clone() {
+            if let AddImm(r1, v1) = other.clone() {
+                if r0 == r1 {
+                    return vec![AddImm(r0, v0.wrapping_add(v1))];
+                }
+            } else if let SubImm(r1, v1) = other.clone() {
+                if r0 == r1 {
+                    if v0 == v1 {
+                        return Vec::new();
+                    } else if v0 < v1 {
+                        return vec![SubImm(r0, v1 - v0)];
+                    } else {
+                        return vec![AddImm(r0, v0 - v1)];
+                    }
+                }
+            }
+        } else if let SubImm(r0, v0) = self.clone() {
+            if let AddImm(r1, _) = other.clone() {
+                if r0 == r1 {
+                    return other.combine(self);
+                }
+            } else if let SubImm(r1, v1) = other.clone() {
+                if r0 == r1 {
+                    return vec![SubImm(r0, v0.wrapping_add(v1))];
+                }
+            }
+        } else if let JumpZero(target) = self.clone() {
+            if let JumpZero(_) = other.clone() {
+                return vec![JumpZero(target)];
+            }
+        } else if let JumpNonZero(target) = self.clone() {
+            if let JumpNonZero(_) = other.clone() {
+                return vec![JumpNonZero(target)];
+            }
+        }
+        vec![self, other]
+    }
+}
+impl fmt::Display for Instruction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_source())
+    }
+}
+
+/// Removes redundant movs
+pub fn optimize_redundant_movs(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut last_known: HashMap<Register64, u64> = HashMap::new();
+    let mut result = Vec::new();
+    for op in ops {
+        let mut include_this = true; // Will Set to false to remove item
+        if let MovImm(r, imm) = op {
+            if last_known.get(&r) == Some(&imm) {
+                include_this = false;
+            }
+        } else if let Mov(r1, r2) = op {
+            if let Some(v) = last_known.get(&r1) {
+                if Some(v) == last_known.get(&r2) {
+                    include_this = false;
+                }
+            }
+        }
+        if include_this {
+            result.push(op.clone());
+        }
+
+        // Update last_kwown table
+        match op {
+            BlackBox(_, _) | NamedBlackBox(_, _, _) => {
+                last_known.clear();
+            },
+            Mov(r, r2) => {
+                if let Some(v) = last_known.clone().get(&r2) {
+                    last_known.insert(r, *v);
+                } else {
+                    last_known.remove(&r);
+                }
+            },
+            MovImm(r, imm) => {
+                last_known.insert(r, imm);
+            },
+            AddImm(r, _) | SubImm(r, _) => {
+                // before jump target labels.
+
+                last_known.remove(&r);
+            },
+            Label(_) => {
+                last_known.clear();
+            },
+            _ => {},
+        }
+    }
+    result
+}
+
+/// Combines adjancent instructions
+pub fn optimize_adjacent(ops: Vec<Instruction>) -> Vec<Instruction> {
+    ops.into_iter()
+        .fold(Vec::new(), |a: Vec<Instruction>, b: Instruction| {
+            let mut result = a.clone();
+            if let Some(last) = result.pop() {
+                result.extend(last.combine(b));
+                result
+            } else {
+                vec![b]
+            }
+        })
+}
+
+/// Combines adjancent immediate memory moves
+pub fn optimize_adjancent_mem_movs(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut result = Vec::new();
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if let MovPtr8Imm(r0, imm) = ops[index] {
+            let mut imms = vec![imm];
+            while index + imms.len() < ops.len() {
+                if let MovPtr8Imm(r1, imm) = ops[index + imms.len()] {
+                    if r0 != r1 {
+                        break;
+                    }
+                    imms.push(imm);
+                } else {
+                    break;
+                }
+            }
+
+            if imms.len() > 1 {
+                imms.truncate(8);
+                while !imms.len().is_power_of_two() {
+                    imms.pop();
+                }
+                let bytes = imms.len();
+                let mut orred: u64 = 0;
+                // Reversed as x86 is little-endian
+                for imm in imms.into_iter().rev() {
+                    orred = (orred << 8) | u64::from(imm);
+                }
+                result.push(match bytes {
+                    2 => MovPtr16Imm(r0, orred as u16),
+                    4 => MovPtr32Imm(r0, orred as u32),
+                    8 => MovPtr64Imm(r0, orred),
+                    _ => unreachable!(),
+                });
+                result.push(AddImm(r0, bytes as u64));
+                index += bytes;
+                continue;
+            }
+        }
+
+        result.push(ops[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// If code begins with setting the first cell to value, use mov instead of add
+pub fn optimize_start_cells(mut ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut index = 0;
+    while index < ops.len() {
+        if let AddPtr8Imm(r0, imm) = ops[index].clone() {
+            if imm == 0 {
+                ops.remove(0);
+                continue;
+            } else {
+                ops[index] = MovPtr8Imm(r0, imm);
+            }
+        } else if let AddImm(_, _) = ops[index] {
+        } else {
+            break;
+        }
+
+        index += 1;
+    }
+    ops
+}
+
+/// Zeroing loop: `[+]` or `[-]`
+pub fn optimize_zero_loop(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut result = Vec::new();
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if index + 2 < ops.len() {
+            if let JumpNonZero(label) = ops[index + 2].clone() {
+                if let AddPtr8Imm(r, 1) | AddPtr8Imm(r, 255) = ops[index + 1] {
+                    if ops[index] == Label(label) {
+                        result.push(MovPtr8Imm(r, 0));
+                        index += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        result.push(ops[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Constant output cycle used by the startup optimizer etc
+pub fn optimize_constant_output(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+
+    let mut name_label: usize = 0;
+    macro_rules! get_label {
+        () => {{
+            let label = format!("constant_output{}", name_label);
+            name_label += 1;
+            label
+        }};
+    }
+
+    let mut result = Vec::new();
+    let mut index: usize = 0;
+    let mut current_bytes = Vec::new();
+    let mut const_strings = Vec::new();
+    let mut write_fn: Option<Instruction> = None;
+    while index < ops.len() {
+        if index + 4 < ops.len() {
+            if let MovPtr8Imm(r0, imm) = ops[index] {
+                if MovImm(Register64::rdi, 1) == ops[index + 1]
+                    && Mov(Register64::rsi, r0) == ops[index + 2]
+                    && MovImm(Register64::rdx, 1) == ops[index + 3]
+                {
+                    if let NamedBlackBox(name, f, eff) = ops[index + 4].clone() {
+                        if name == "write" {
+                            let bb = BlackBox(f, eff);
+                            if let Some(wf) = write_fn.clone() {
+                                debug_assert_eq!(wf, bb);
+                            } else {
+                                write_fn = Some(bb);
+                            }
+                            current_bytes.push(imm);
+                            index += 5;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !current_bytes.is_empty() {
+            let name = get_label!();
+
+            result.push(MovImm(Register64::rdi, 1));
+            result.push(MovImmVar(Register64::rsi, name.clone()));
+            result.push(MovImm(Register64::rdx, current_bytes.len() as u64));
+            result.push(write_fn.clone().unwrap());
+
+            const_strings.push(Data(name, current_bytes.clone()));
+            current_bytes.clear();
+        }
+
+        result.push(ops[index].clone());
+        index += 1;
+    }
+    result.extend(const_strings);
+    result
+}
+
+/// Removes redundant cmp instructions where zero flag can was set by the previous instruction
+pub fn optimize_zero_flags(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut result = Vec::new();
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if let IsZeroPtr8(r0) = ops[index] {
+            let mut i: usize = 1;
+            while i < index {
+                if ops[index - i].affects_zero_flag() {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= 1 {
+                if IsZeroPtr8(r0) == ops[index - i] {
+                    index += 1;
+                    continue;
+                } else if let AddPtr8Imm(r1, _) = ops[index - i] {
+                    if r0 == r1 {
+                        index += 1;
+                        continue;
+                    } else if let NamedBlackBox(name, _, _) = &ops[index - i] {
+                        if name == "read" {
+                            index += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        result.push(ops[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Removes dead code, i.e. unconditional jumps over sections
+pub fn optimize_remove_dead_code(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut result = Vec::new();
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if let Jump(l0) = &ops[index] {
+            let mut ok = true;
+            let mut i: usize = 1;
+            while index + i < ops.len() {
+                if let Label(l1) = &ops[index + i] {
+                    ok = l0 == l1;
+                    break;
+                }
+                i += 1;
+            }
+
+            if ok && i > 1 {
+                index += i;
+                continue;
+            }
+        }
+
+        result.push(ops[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Removes unused labels
+pub fn optimize_remove_unused_labels(ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+
+    let mut used_labels = HashSet::new();
+    for op in &ops {
+        if let Jump(l) | JumpZero(l) | JumpNonZero(l) = op {
+            used_labels.insert(l.clone());
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if let Label(l) = &ops[index] {
+            if !used_labels.contains(l) {
+                index += 1;
+                continue;
+            }
+        }
+
+        result.push(ops[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Removes instructions that cause no effects
+pub fn optimize_remove_nops(mut ops: Vec<Instruction>) -> Vec<Instruction> {
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if let Some(efs) = ops[index].effects() {
+            let mut required = true;
+            if efs == Effects::NOP {
+                required = false;
+            } else if efs.flags && !(efs.registers || efs.control_flow) {
+                // Test if the flags are overwritten before next instruction that uses them.
+                // Note that the compiler currently makes almost no assumptions about events
+                // before jump target labels.
+                required = false; // Switch default for the loop
+                let mut i: usize = 1;
+                while index + i < ops.len() {
+                    if ops[index + i].reads_zf() {
+                        required = true;
+                        break;
+                    } else if let Some(e) = ops[index + i].effects() {
+                        if e.flags {
+                            // Next effect shadows flag changes
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            if !required {
+                ops.remove(index);
+                continue;
+            }
+        }
+        index += 1;
+    }
+    ops
+}
+
+pub fn label_index(ops: &[Instruction], label: &str) -> usize {
+    let t = Instruction::Label(label.to_owned());
+    for (i, op) in ops.iter().cloned().enumerate() {
+        if op == t {
+            return i;
+        }
+    }
+    unreachable!("Label doesn't exist");
+}
+
+/// Jumps directly over check if negation of condition is check after jump
+pub fn optimize_jump_skip_recheck(mut ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+
+    let mut next_label: usize = 0;
+    macro_rules! get_label {
+        () => {{
+            let label = format!(".jump_skip_recheck{}", next_label);
+            next_label += 1;
+            label
+        }};
+    }
+
+    let mut index: usize = 1;
+    while index < ops.len() {
+        if let IsZeroPtr8(r) = ops[index - 1].clone() {
+            if let JumpZero(label) = ops[index].clone() {
+                let li = label_index(&ops, &label);
+                if li + 2 < ops.len() && IsZeroPtr8(r) == ops[li + 1] {
+                    if let JumpNonZero(_) = ops[li + 2].clone() {
+                        let new_label = get_label!();
+                        ops[index] = JumpZero(new_label.clone());
+                        ops.insert(li + 3, Label(new_label));
+                        if li < index {
+                            debug_assert!(li + 3 < index);
+                            index += 1;
+                        }
+                    }
+                }
+            } else if let JumpNonZero(label) = ops[index].clone() {
+                let li = label_index(&ops, &label);
+                if li + 2 < ops.len() && IsZeroPtr8(r) == ops[li + 1] {
+                    if let JumpZero(_) = ops[li + 2].clone() {
+                        let new_label = get_label!();
+                        ops[index] = JumpNonZero(new_label.clone());
+                        ops.insert(li + 3, Label(new_label));
+                        if li < index {
+                            debug_assert!(li + 3 < index);
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    ops
+}
+
+/// Separates instructions and data
+pub fn separate_data(mut ops: Vec<Instruction>) -> (Vec<Instruction>, Vec<Instruction>) {
+    use Instruction::*;
+    let mut data: Vec<Instruction> = Vec::new();
+    let mut index: usize = 0;
+    while index < ops.len() {
+        if let Data(_, _) = ops[index] {
+            data.push(ops.remove(index));
+            continue;
+        }
+        index += 1;
+    }
+    data.sort();
+    (ops, data)
+}
+
+/// Moves data instructions to the end of data buffer
+pub fn move_data_to_end(ops: Vec<Instruction>) -> Vec<Instruction> {
+    let (mut ops, data) = separate_data(ops);
+    ops.extend(data.into_iter());
+    ops
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pass {
+    /// Name of the pass
+    name: String,
+    /// Actual function
+    function: fn(Vec<Instruction>) -> Vec<Instruction>,
+    /// List of passes to be executed immediately after this
+    cleanup: Vec<PassId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PassId(usize);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Optimizer {
+    /// Passes
+    passes: Vec<Pass>,
+}
+impl Optimizer {
+    pub fn new() -> Self {
+        Self { passes: Vec::new() }
+    }
+
+    pub fn add_pass(&mut self, pass: Pass) -> PassId {
+        if self.passes.iter().any(|p| p.name == pass.name) {
+            panic!("Pass named {} already exists", pass.name);
+        }
+        self.passes.push(pass);
+        PassId(self.passes.len() - 1)
+    }
+
+    pub fn get_id(&self, name: &str) -> PassId {
+        self.passes
+            .iter()
+            .enumerate()
+            .find_map(|(i, p)| if p.name == name { Some(PassId(i)) } else { None })
+            .unwrap_or_else(|| panic!("Pass {} not defined yet", name))
+    }
+
+    pub fn get(&self, id: PassId) -> Pass {
+        self.passes[id.0].clone()
+    }
+}
+
+/// Removes redundant movs
+pub fn optimize(mut ops: Vec<Instruction>) -> Vec<Instruction> {
+    let mut optimizer = Optimizer::new();
+
+    macro_rules! pass {
+        ($optimizer:ident; $name:ident; $($cleanup:ident),*) => {
+            $optimizer.add_pass(Pass {
+                name: stringify!($name).to_owned(),
+                function: $name,
+                cleanup: vec![$(optimizer.get_id(stringify!($cleanup)),)*],
+            })
+        };
+        ($optimizer:ident; $name:ident) => {pass!($optimizer; $name;)};
+    };
+
+    pass!(optimizer; optimize_start_cells);
+    pass!(optimizer; optimize_zero_loop);
+    pass!(optimizer; optimize_zero_flags);
+    pass!(optimizer; optimize_remove_unused_labels);
+    pass!(optimizer; optimize_remove_nops);
+    pass!(optimizer; optimize_adjacent; optimize_remove_nops);
+    pass!(optimizer; optimize_adjancent_mem_movs; optimize_remove_nops, optimize_zero_loop, optimize_adjacent);
+    pass!(optimizer; optimize_constant_output);
+    pass!(optimizer; optimize_jump_skip_recheck; optimize_remove_unused_labels, optimize_remove_nops);
+    pass!(optimizer; optimize_remove_dead_code; optimize_remove_unused_labels, optimize_remove_nops);
+
+    for pass in optimizer.passes.clone() {
+        log::trace!("Optimization: {}", pass.name);
+        ops = (pass.function)(ops);
+        ops = move_data_to_end(ops);
+        for pass_id in pass.cleanup {
+            log::trace!("Optimization (cleanup): {}", optimizer.get(pass_id).name);
+            ops = (optimizer.get(pass_id).function)(ops);
+            ops = move_data_to_end(ops);
+        }
+    }
+
+    ops
+}
+
+// TODO: Future optimizations:
+// `[<]` and `[>]` to scan loops
+// `,[>,]` to read until EOF
+// `[.>]` to print null-terminated string, i.e. scan and print
+
+// dec rbx
+// inc byte [rbx]
+// inc rbx
+// dec byte [rbx]
+// TO
+// inc byte [rbx - 1]
+// inc byte [rbx]
