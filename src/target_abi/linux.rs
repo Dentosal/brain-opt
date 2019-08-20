@@ -39,7 +39,7 @@ impl Operations for Interface {
                 io: true,
             }),
             MovImm(Register64::rdi, 0),
-            BlackBox("call exit".to_owned(), Effects {
+            NamedBlackBox("exit".to_owned(), "exit".to_owned(), Effects {
                 flags: true,
                 registers: true,
                 control_flow: true,

@@ -36,7 +36,7 @@ impl Operations for Interface {
         use Instruction::*;
         vec![
             MovImm(Register64::rdi, 0),
-            BlackBox("call _exit".to_owned(), Effects {
+            NamedBlackBox("exit".to_owned(), "call _exit".to_owned(), Effects {
                 flags: true,
                 registers: true,
                 control_flow: true,

@@ -262,6 +262,54 @@ pub fn optimize_zero_flags(ops: Vec<Instruction>) -> Vec<Instruction> {
     result
 }
 
+/// Removes redundant instructions just before exit is called
+pub fn optimize_exit(mut ops: Vec<Instruction>) -> Vec<Instruction> {
+    use Instruction::*;
+    let mut index: usize = 0;
+    'outer: while index < ops.len() {
+        // Test if this instruction can be removed
+        if let Label(_) = ops[index] {
+            index += 1;
+            continue;
+        } else if let Some(eff) = ops[index].effects() {
+            if eff.control_flow || eff.io {
+                index += 1;
+                continue;
+            }
+        } else {
+            index += 1;
+            continue;
+        }
+
+        let mut offset: usize = 1;
+        // Scan forward until exit or dependency,
+        while index + offset < ops.len() {
+            if let NamedBlackBox(name, _, _) = &ops[index + offset] {
+                if name == "exit" {
+                    // Preserve one instruction before exit, as that sets the exit code
+                    if offset > 1 {
+                        ops.remove(index);
+                        continue 'outer;
+                    } else {
+                        debug_assert_eq!(MovImm(Register64::rdi, 0), ops[index + offset - 1]);
+                    }
+                }
+            }
+
+            // If side effects are found, this instruction cannot be removed
+            if let Some(eff) = ops[index + offset].effects() {
+                if eff.control_flow || eff.io {
+                    break;
+                }
+            }
+
+            offset += 1;
+        }
+        index += 1;
+    }
+    ops
+}
+
 /// Removes dead code, i.e. unconditional jumps over sections
 pub fn optimize_remove_dead_code(ops: Vec<Instruction>) -> Vec<Instruction> {
     use Instruction::*;
@@ -506,6 +554,7 @@ pub fn optimize(mut ops: Vec<Instruction>) -> Vec<Instruction> {
     pass!(optimizer; optimize_constant_output);
     pass!(optimizer; optimize_jump_skip_recheck; optimize_remove_unused_labels, optimize_remove_nops);
     pass!(optimizer; optimize_remove_dead_code; optimize_remove_unused_labels, optimize_remove_nops);
+    pass!(optimizer; optimize_exit; optimize_remove_unused_labels, optimize_remove_nops);
 
     for pass in optimizer.passes.clone() {
         log::trace!("Optimization: {}", pass.name);
