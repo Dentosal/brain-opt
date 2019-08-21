@@ -584,8 +584,8 @@ pub fn optimize(mut ops: Vec<Instruction>) -> Vec<Instruction> {
     pass!(optimizer; optimize_zero_loop);
     pass!(optimizer; optimize_zero_flags; optimize_remove_unused_labels);
     pass!(optimizer; optimize_remove_nops; optimize_remove_unused_labels);
-    pass!(optimizer; optimize_adjacent; optimize_remove_nops);
-    pass!(optimizer; optimize_adjancent_mem_movs; optimize_remove_nops, optimize_zero_loop, optimize_adjacent);
+    pass!(optimizer; optimize_adjancent_mem_movs; optimize_remove_nops, optimize_zero_loop);
+    pass!(optimizer; optimize_adjacent);
     pass!(optimizer; optimize_constant_output);
     pass!(optimizer; optimize_dead_jumps; optimize_remove_unused_labels, optimize_remove_nops);
     pass!(optimizer; optimize_jump_skip_recheck; optimize_remove_unused_labels, optimize_dead_jumps);
