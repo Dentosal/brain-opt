@@ -25,6 +25,10 @@ struct Args {
     #[structopt(short, long, parse(from_os_str))]
     assembly: Option<PathBuf>,
 
+    /// Skip actual compilation and linking
+    #[structopt(short, long)]
+    skip_compilation: bool,
+
     /// Specify target ABI to use. Defaults to current OS ABI.
     #[structopt(short, long, raw(possible_values = "&ABI::variants()"))]
     target: Option<ABI>,
@@ -69,6 +73,10 @@ fn main() -> Result<()> {
         } else {
             fs::write(out_asm, asm.as_bytes())?;
         }
+    }
+
+    if args.skip_compilation {
+        return Ok(());
     }
 
     let dir = tempdir()?;
