@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -38,6 +39,26 @@ fn assert_output<P: AsRef<Path>>(path: P, input: &'static [u8], output: &'static
     let res = p.wait_with_output().unwrap();
     assert!(res.status.success());
     assert_eq!(res.stdout, output);
+}
+
+fn get_assembly<P: AsRef<Path>>(path: P) -> String {
+    let td = tempdir().unwrap();
+    let asmpath = td.path().join("out.asm");
+    let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
+    let compiler = cmd
+        .arg(path.as_ref().as_os_str())
+        .arg("--assembly")
+        .arg(asmpath.clone())
+        .output()
+        .unwrap();
+    println!("<compiler stdout>");
+    println!("{}", String::from_utf8_lossy(&compiler.stdout));
+    println!("</compiler stdout>");
+    println!("<compiler stderr>");
+    println!("{}", String::from_utf8_lossy(&compiler.stderr));
+    println!("</compiler stderr>");
+    assert!(compiler.status.success());
+    String::from_utf8(fs::read(asmpath).unwrap()).unwrap()
 }
 
 #[test]
@@ -107,4 +128,10 @@ fn fail_quicksort() {
 #[should_panic]
 fn fail_rot13() {
     assert_output("examples/rot13.bf", b"abc", b"abc");
+}
+
+#[test]
+fn test_assembly_helloworld() {
+    let asm = get_assembly("examples/helloworld.bf");
+    assert!(asm.contains("\"Hello World!\""));
 }
