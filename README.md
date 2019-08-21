@@ -16,28 +16,29 @@ Consider this rather beautiful `Hello World!` program:
 That gets optimized to: (manually commented)
 
 ```assembly
-extern _read
-extern _write
-extern _exit
-global _main
+extern read
+extern write
+extern exit
+global main
 
 section .text
-_main:
-sub rsp, 30000
-mov rcx, 30000
-mov rdi, rsp
-xor al, al
-rep stosb
-mov rbx, rsp
-sub rsp, 8
-mov rdi, 1
-mov rsi, constant_output0
-mov rdx, 13
-call _write
-xor rdi, rdi
-call _exit
+main:                           ; entry point
+    sub rsp, 30000              ; allocate stack space
+    mov rcx, 30000              ; set argument: count
+    mov rdi, rsp                ; set argument: start
+    xor al, al                  ; set argument: byte to clear with
+    rep stosb                   ; zero allocated stack space
+    mov rbx, rsp                ; set cell pointer
+    sub rsp, 8                  ; align stack for extern calls
+    mov rdi, 1                  ; set argument: fd = stdout
+    mov rsi, constant_output0   ; set argument: buf = constant_output0
+    mov rdx, 13                 ; set argument: count = 13
+    call _write                 ; actually write to stdout
+    xor rdi, rdi                ; set status code = 0
+    call _exit                  ; exit
+
 section .data
-constant_output0: db "Hello World!",0xa
+    constant_output0: db "Hello World!",0xa
 ```
 
 It's rather well optimized fast, although cleaning 30000 bytes of stack is still not optimized away.
